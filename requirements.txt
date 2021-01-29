@@ -1,4 +1,6 @@
 aether.python
+cachetools
 firebase_admin
 flask
 google-cloud-firestore
+pydantic

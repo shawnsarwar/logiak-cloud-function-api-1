@@ -19,11 +19,12 @@
 # under the License.
 
 import logging
+import json
 import os
 
 import firebase_admin
-from firebase_admin.credentials import ApplicationDefault
-from flask import Response
+from firebase_admin.credentials import ApplicationDefault, Certificate
+from flask import make_response, Response
 from google.auth.credentials import AnonymousCredentials
 from google.cloud.firestore_v1.client import Client as CFS_Client
 
@@ -43,7 +44,21 @@ _STRIP = utils.path_stripper([ROOT_PATH, ''])
 
 SCHEMAS = {}
 
-if (local_fb_uri := os.environ.get('FIREBASE_DATABASE_EMULATOR_HOST', False)):
+if (fb_uri := os.environ.get('FIREBASE_HOST', False)):
+    LOG.debug('Connecting to Live Firebase from local functions')
+    project_id = os.environ.get('FIREBASE_PROJECT_ID')
+    cert = os.environ.get('FIREBASE_CREDENTIALS')
+    credentials = Certificate(json.loads(cert))
+    LOG.debug('Connecting to Local Emulator')
+    APP = firebase_admin.initialize_app(
+        name=project_id,
+        credential=credentials,
+        options={
+            'databaseURL': fb_uri,
+            'projectId': project_id
+        })
+    CFS = fb_utils.Firestore(app=APP)
+elif (local_fb_uri := os.environ.get('FIREBASE_DATABASE_EMULATOR_HOST', False)):
     LOG.debug('Connecting to Local Emulator')
     _local = 'local'
     uri = f'http://{local_fb_uri}/?ns={_local}'
@@ -71,35 +86,58 @@ RTDB = fb_utils.RTDB(APP)
 AUTH_HANDLER = AuthHandler(RTDB)
 
 
+def allow_cors(fn):
+    cors_domain = os.environ.get('CORS_DOMAIN', '*')
+
+    def wrapper(request, *args, **kwargs):
+        if request.method != 'OPTIONS':
+            res: Response = fn(request, *args, **kwargs)
+        else:
+            res = Response('', 204)
+        res.headers['Access-Control-Allow-Origin'] = cors_domain
+        res.headers['Access-Control-Allow-Headers'] = '*'
+        res.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, DELETE'
+        return res
+    return wrapper
+
+
 # actual request handlers
 
 
 # route all from base path (usually APP_ID, name or alias)
+@allow_cors
 def handle_all(request):
-    path = request.path.split('/')
-    root = _STRIP(path)[0]
-    if root == 'auth':
-        return handle_auth(request)
-    elif root == 'meta':
-        return handle_meta(request)
-    elif root == 'data':
-        return handle_data(request)
-    return Response(f'Not Found @ {path}', 404)
+    try:
+        path = request.path.split('/')
+        root = _STRIP(path)[0]
+        if root == 'auth':
+            return handle_auth(request)
+        elif root == 'meta':
+            return handle_meta(request)
+        elif root == 'data':
+            return handle_data(request)
+        return Response(f'Not Found @ {path}', 404)
+    except Exception as err:
+        return Response(f'Unhandled Server Error: {err}', 500)
 
 
+@allow_cors
 def handle_auth(request):
     data = request.get_json(force=True, silent=True)
     return auth_request(data, AUTH_HANDLER)
 
 
+@allow_cors
 @require_auth(AUTH_HANDLER)
 def handle_meta(request):
     path = request.path.split('/')
     return meta.resolve(path, RTDB)
 
 
+@allow_cors
 @require_auth(AUTH_HANDLER)
 def handle_data(request):
     user_id = request.headers.get('Logiak-User-Id')
     path = request.path.split('/')
-    return data.resolve(user_id, path, CFS)
+    data_ = request.get_json()
+    return data.resolve(user_id, path, CFS, RTDB, data_)
